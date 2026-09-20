@@ -209,6 +209,11 @@ as a fallback for simple, high-confidence cases.
   is reported as invalid.
 - Matching is intentionally conservative: close competing client names are
   reported as ambiguous rather than silently choosing one.
+- Database repositories use handwritten SQL strings. Runtime values are
+  parameterized, so this is not an SQL-injection concern, but schema changes
+  require SQL and C# repository code to be kept in sync. A migration tool or a
+  data-access abstraction could reduce that maintenance risk as the schema
+  grows.
 - Foreign keys prevent a work order from referring to a missing client or
   technician. The report is the primary place to review rows that were skipped.
 
