@@ -24,4 +24,8 @@ public static class ImportErrors
     public static readonly ImportError TotalMissingOrInvalid = new(
         "total_missing_or_invalid",
         "Total is missing or invalid.");
+
+    public static readonly ImportError BatchPersistenceFailed = new(
+        "batch_persistence_failed",
+        "The work-order batch could not be saved and can be retried.");
 }

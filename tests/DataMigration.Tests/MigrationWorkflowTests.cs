@@ -11,6 +11,7 @@ namespace DataMigration.Tests;
 
 public sealed class MigrationWorkflowTests
 {
+    private static readonly string TestWorkOrdersFilePath = CreateTestWorkOrdersFile();
     [Fact]
     public async Task RunAsync_PersistsWorkOrdersAndReportRowsInConfiguredBatches()
     {
@@ -30,12 +31,13 @@ public sealed class MigrationWorkflowTests
             new FakeClientRepository(client),
             new FakeTechnicianRepository(technician),
             workOrderRepository,
+            new FakeImportRunRepository(),
             new ClientMatcher(),
             new NotesParser(),
             reportWriter,
             workOrderBatchSize: 2);
 
-        await workflow.RunAsync(new MigrationRequest("clients.xlsx", "work-orders.xlsx"), null, CancellationToken.None);
+        await workflow.RunAsync(new MigrationRequest("clients.xlsx", TestWorkOrdersFilePath), null, CancellationToken.None);
 
         Assert.Equal([2, 1], workOrderRepository.BatchSizes);
         Assert.Equal([2, 1], reportWriter.BatchSizes);
@@ -49,12 +51,13 @@ public sealed class MigrationWorkflowTests
             new FakeClientRepository(new Client("Andi", "Muçobegaj")),
             new FakeTechnicianRepository(new Technician("Arben", "Hoxha")),
             new RecordingWorkOrderRepository(),
+            new FakeImportRunRepository(),
             new ClientMatcher(),
             new NotesParser(),
             new RecordingReportWriter());
 
         ImportFileValidationException exception = await Assert.ThrowsAsync<ImportFileValidationException>(
-            () => workflow.RunAsync(new MigrationRequest("clients.csv", "work-orders.xlsx"), null, CancellationToken.None));
+            () => workflow.RunAsync(new MigrationRequest("clients.csv", TestWorkOrdersFilePath), null, CancellationToken.None));
 
         Assert.Equal("The clients file must have a .xlsx extension: 'clients.csv'.", exception.Message);
     }
@@ -78,12 +81,13 @@ public sealed class MigrationWorkflowTests
             new FakeClientRepository(client),
             new FakeTechnicianRepository(technician),
             workOrderRepository,
+            new FakeImportRunRepository(),
             new ClientMatcher(),
             new NotesParser(),
             reportWriter);
 
         MigrationSummary summary = await workflow.RunAsync(
-            new MigrationRequest("clients.xlsx", "work-orders.xlsx"), null, CancellationToken.None);
+            new MigrationRequest("clients.xlsx", TestWorkOrdersFilePath), null, CancellationToken.None);
 
         Assert.Equal(1, summary.Succeeded);
         Assert.Equal(1, summary.Failed);
@@ -129,6 +133,13 @@ public sealed class MigrationWorkflowTests
         }
     }
 
+    private static string CreateTestWorkOrdersFile()
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"work-orders-{Guid.NewGuid():N}.xlsx");
+        File.WriteAllText(path, string.Empty);
+        return path;
+    }
+
     private sealed class FakeClientRepository(Client client) : IClientRepository
     {
         public Task<IReadOnlyList<Client>> UpsertClientsAsync(IEnumerable<Client> clients, CancellationToken ct) =>
@@ -141,18 +152,27 @@ public sealed class MigrationWorkflowTests
             Task.FromResult<IReadOnlyList<Technician>>([technician]);
     }
 
-    private sealed class RecordingWorkOrderRepository : IWorkOrderRepository
+    private sealed class RecordingWorkOrderRepository : IWorkOrderImportRepository
     {
         public List<WorkOrder> WorkOrders { get; } = [];
         public List<int> BatchSizes { get; } = [];
 
-        public Task BulkInsertAsync(IEnumerable<WorkOrder> workOrders, CancellationToken ct)
+        public Task<IReadOnlyList<ImportResult>> SaveBatchAsync(Guid importRunId, IEnumerable<WorkOrderImportItem> items, CancellationToken ct)
         {
-            List<WorkOrder> batch = [.. workOrders];
+            List<WorkOrderImportItem> importItems = [.. items];
+            List<WorkOrder> batch = importItems.Where(item => item.WorkOrder is not null).Select(item => item.WorkOrder!).ToList();
             BatchSizes.Add(batch.Count);
             WorkOrders.AddRange(batch);
-            return Task.CompletedTask;
+            return Task.FromResult<IReadOnlyList<ImportResult>>(importItems.Select(item => item.Result).ToList());
         }
+    }
+
+    private sealed class FakeImportRunRepository : IImportRunRepository
+    {
+        public Task<ImportRun> GetOrCreateAsync(string sourceFileHash, string sourceFileName, CancellationToken ct) =>
+            Task.FromResult(new ImportRun(Guid.Empty, sourceFileHash));
+
+        public Task CompleteAsync(Guid importRunId, bool completedWithErrors, CancellationToken ct) => Task.CompletedTask;
     }
 
     private sealed class RecordingReportWriter : IImportReportWriter

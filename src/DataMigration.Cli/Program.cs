@@ -19,6 +19,7 @@ var workflow = new MigrationWorkflow(
     new ClientRepository(connectionString),
     new TechnicianRepository(connectionString),
     new WorkOrderRepository(connectionString),
+    new ImportRunRepository(connectionString),
     new ClientMatcher(),
     new NotesParser(),
     new CsvImportReportWriter());

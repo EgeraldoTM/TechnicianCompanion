@@ -176,6 +176,13 @@ CSV report before its memory is released. Clients and technicians are
 deduplicated in memory before their staged upserts; this is appropriate because
 they are expected to be much smaller reference-data sets than the work orders.
 
+Each work-order workbook is identified by a SHA-256 hash and mapped to an
+`ImportRuns` record. A batch stores its work orders and row-level import results
+in one SQL transaction. If it fails, SQL rolls back the whole batch; the
+importer records the batch failure in the CSV and continues with later batches.
+Re-running the same workbook reuses its import run and its `(ImportRunId, Excel
+row index)` unique keys, so already committed rows are not inserted twice.
+
 Client matching currently ranks every imported client for each work order. This
 is suitable for typical operational spreadsheets, but its approximate cost is
 `work orders × clients`. For very large client lists or multi-million-row

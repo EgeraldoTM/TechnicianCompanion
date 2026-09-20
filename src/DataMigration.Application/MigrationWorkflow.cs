@@ -5,6 +5,7 @@ using DataMigration.Application.Models;
 using DataMigration.Application.Models.Matching;
 using DataMigration.Core.Extensions;
 using DataMigration.Core.Models;
+using System.Security.Cryptography;
 
 namespace DataMigration.Application;
 
@@ -12,7 +13,8 @@ public sealed class MigrationWorkflow(
     IExcelReader excelReader,
     IClientRepository clientRepository,
     ITechnicianRepository technicianRepository,
-    IWorkOrderRepository workOrderRepository,
+    IWorkOrderImportRepository workOrderImportRepository,
+    IImportRunRepository importRunRepository,
     IClientMatcher clientMatcher,
     INotesParser notesParser,
     IImportReportWriter reportWriter,
@@ -21,7 +23,8 @@ public sealed class MigrationWorkflow(
     private readonly IExcelReader _excelReader = excelReader;
     private readonly IClientRepository _clientRepository = clientRepository;
     private readonly ITechnicianRepository _technicianRepository = technicianRepository;
-    private readonly IWorkOrderRepository _workOrderRepository = workOrderRepository;
+    private readonly IWorkOrderImportRepository _workOrderImportRepository = workOrderImportRepository;
+    private readonly IImportRunRepository _importRunRepository = importRunRepository;
     private readonly IClientMatcher _clientMatcher = clientMatcher;
     private readonly INotesParser _notesParser = notesParser;
     private readonly IImportReportWriter _reportWriter = reportWriter;
@@ -37,6 +40,10 @@ public sealed class MigrationWorkflow(
         ValidateExcelFilePath(request.ClientsFilePath, "clients");
         ValidateExcelFilePath(request.WorkOrdersFilePath, "work-orders");
 
+        string sourceFileHash = await CalculateFileHashAsync(request.WorkOrdersFilePath, ct);
+        ImportRun importRun = await _importRunRepository.GetOrCreateAsync(
+            sourceFileHash, Path.GetFileName(request.WorkOrdersFilePath), ct);
+
         var insertedClients = await MigrateClientsAsync(request.ClientsFilePath, ct);
         var insertedTechnicians = await MigrateTechniciansAsync(request.WorkOrdersFilePath, ct);
 
@@ -50,7 +57,7 @@ public sealed class MigrationWorkflow(
             "work-order-import-report.csv");
         await _reportWriter.InitializeAsync(reportPath, ct);
 
-        List<WorkOrder> validWorkOrders = [];
+        Dictionary<int, WorkOrder> validWorkOrders = [];
         List<ImportResult> results = [];
         int processed = 0;
         int succeeded = 0;
@@ -62,14 +69,14 @@ public sealed class MigrationWorkflow(
             var workOrderResult = ConstructWorkOrder(row, techniciansByName);
             results.Add(workOrderResult.Result);
             if (workOrderResult.WorkOrder is not null)
-                validWorkOrders.Add(workOrderResult.WorkOrder);
+                validWorkOrders.Add(workOrderResult.Result.RowIndex, workOrderResult.WorkOrder);
 
             processed++;
             progress?.Report(new MigrationProgress(processed, 0));
 
             if (results.Count == _workOrderBatchSize)
             {
-                MigrationBatchSummary batchSummary = await PersistBatchAsync(validWorkOrders, results, reportPath, ct);
+                MigrationBatchSummary batchSummary = await PersistBatchAsync(importRun.Id, validWorkOrders, results, reportPath, ct);
                 succeeded += batchSummary.Succeeded;
                 failed += batchSummary.Failed;
             }
@@ -77,11 +84,12 @@ public sealed class MigrationWorkflow(
 
         if (results.Count > 0)
         {
-            MigrationBatchSummary batchSummary = await PersistBatchAsync(validWorkOrders, results, reportPath, ct);
+            MigrationBatchSummary batchSummary = await PersistBatchAsync(importRun.Id, validWorkOrders, results, reportPath, ct);
             succeeded += batchSummary.Succeeded;
             failed += batchSummary.Failed;
         }
 
+        await _importRunRepository.CompleteAsync(importRun.Id, failed > 0, ct);
         return new MigrationSummary(succeeded, failed, reportPath);
     }
 
@@ -189,15 +197,35 @@ public sealed class MigrationWorkflow(
     private sealed record MigrationBatchSummary(int Succeeded, int Failed);
 
     private async Task<MigrationBatchSummary> PersistBatchAsync(
-        List<WorkOrder> validWorkOrders,
+        Guid importRunId,
+        Dictionary<int, WorkOrder> validWorkOrders,
         List<ImportResult> results,
         string reportPath,
         CancellationToken ct)
     {
-        await _workOrderRepository.BulkInsertAsync(validWorkOrders, ct);
-        await _reportWriter.AppendAsync(results, reportPath, ct);
+        IReadOnlyList<ImportResult> batchResults;
+        try
+        {
+            batchResults = await _workOrderImportRepository.SaveBatchAsync(
+                importRunId,
+                results.Select(result => new WorkOrderImportItem(
+                    validWorkOrders.GetValueOrDefault(result.RowIndex), result)),
+                ct);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            batchResults = results.Select(result => result with
+            {
+                Successful = false,
+                Errors = [.. result.Errors, ImportErrors.BatchPersistenceFailed]
+            }).ToList();
+        }
 
-        MigrationBatchSummary summary = new(validWorkOrders.Count, results.Count(result => !result.Successful));
+        await _reportWriter.AppendAsync(batchResults, reportPath, ct);
+
+        MigrationBatchSummary summary = new(
+            batchResults.Count(result => result.Successful),
+            batchResults.Count(result => !result.Successful));
         validWorkOrders.Clear();
         results.Clear();
         return summary;
@@ -210,5 +238,12 @@ public sealed class MigrationWorkflow(
             throw new ImportFileValidationException(
                 $"The {fileDescription} file must have a .xlsx extension: '{filePath}'.");
         }
+    }
+
+    private static async Task<string> CalculateFileHashAsync(string filePath, CancellationToken ct)
+    {
+        await using FileStream stream = new(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        byte[] hash = await SHA256.HashDataAsync(stream, ct);
+        return Convert.ToHexString(hash);
     }
 }
